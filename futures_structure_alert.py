@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Any
 
 
-FUTURES_URL = "https://fapi.binance.com"
+FUTURES_URLS = (
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+)
 TELEGRAM_URL = "https://api.telegram.org"
 TIMEFRAMES = ("4h",)
 KLINE_LIMIT = 1000
@@ -105,7 +110,16 @@ def http_json(
 
 
 def available_symbols(pacer: RequestPacer) -> list[str]:
-    exchange_info = http_json(FUTURES_URL, "/fapi/v1/exchangeInfo", {}, pacer)
+    exchange_info = None
+    last_error = ""
+    for base_url in FUTURES_URLS:
+        try:
+            exchange_info = http_json(base_url, "/fapi/v1/exchangeInfo", {}, pacer)
+            break
+        except Exception as error:
+            last_error = str(error)
+    if exchange_info is None:
+        raise RuntimeError(f"Binance Futures API unavailable: {last_error}")
     symbols = {
         item["symbol"]
         for item in exchange_info.get("symbols", [])
@@ -120,12 +134,21 @@ def available_symbols(pacer: RequestPacer) -> list[str]:
 def get_closed_candles(
     symbol: str, timeframe: str, pacer: RequestPacer
 ) -> list[Candle]:
-    rows = http_json(
-        FUTURES_URL,
-        "/fapi/v1/klines",
-        {"symbol": symbol, "interval": timeframe, "limit": KLINE_LIMIT},
-        pacer,
-    )
+    rows = None
+    last_error = ""
+    for base_url in FUTURES_URLS:
+        try:
+            rows = http_json(
+                base_url,
+                "/fapi/v1/klines",
+                {"symbol": symbol, "interval": timeframe, "limit": KLINE_LIMIT},
+                pacer,
+            )
+            break
+        except Exception as error:
+            last_error = str(error)
+    if rows is None:
+        raise RuntimeError(f"Binance candles unavailable: {last_error}")
     if len(rows) < 3:
         raise RuntimeError(f"Not enough {timeframe} candles returned")
     return [
