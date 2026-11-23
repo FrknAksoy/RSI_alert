@@ -19,8 +19,11 @@ from typing import Any
 
 
 BYBIT_URLS = (
-    "https://api.bybit.com",
     "https://api.bytick.com",
+    "https://api.bybit.eu",
+    "https://api.bybit.kz",
+    "https://api.bybitglobal.com",
+    "https://api.bybit.com",
 )
 TELEGRAM_URL = "https://api.telegram.org"
 TIMEFRAMES = ("4h",)
