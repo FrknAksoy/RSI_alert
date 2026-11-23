@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,7 +20,7 @@ from typing import Any
 
 FUTURES_URL = "https://fapi.binance.com"
 TELEGRAM_URL = "https://api.telegram.org"
-TIMEFRAMES = ("1h", "4h")
+TIMEFRAMES = ("4h",)
 KLINE_LIMIT = 1000
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 1.0
@@ -469,24 +470,36 @@ def scan_pair(
         }
 
 
-def load_state() -> set[str]:
+def load_state() -> dict[str, Any]:
     if not STATE_FILE.exists():
-        return set()
+        return {
+            "active_conditions": [],
+            "hourly_seen": [],
+            "hourly_bucket": "",
+            "hourly_sent_bucket": "",
+        }
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Could not read alert state: {error}") from error
-    active = data.get("active_conditions")
-    if not isinstance(active, list) or not all(isinstance(item, str) for item in active):
+    if not isinstance(data, dict):
         raise RuntimeError("Alert state file has an invalid format")
-    return set(active)
+    for key in ("active_conditions", "hourly_seen"):
+        value = data.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise RuntimeError("Alert state file has an invalid format")
+    if not isinstance(data.get("hourly_bucket", ""), str):
+        raise RuntimeError("Alert state file has an invalid format")
+    if not isinstance(data.get("hourly_sent_bucket", ""), str):
+        raise RuntimeError("Alert state file has an invalid format")
+    return data
 
 
-def save_state(active_conditions: set[str]) -> None:
+def save_state(state: dict[str, Any]) -> None:
     temporary = STATE_FILE.with_suffix(".tmp")
     try:
         temporary.write_text(
-            json.dumps({"active_conditions": sorted(active_conditions)}),
+            json.dumps(state),
             encoding="utf-8",
         )
         temporary.replace(STATE_FILE)
@@ -500,7 +513,9 @@ def send_telegram(message: str) -> None:
     if not token or not chat_id:
         raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID GitHub secrets are required")
 
-    body = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode("utf-8")
+    body = urllib.parse.urlencode(
+        {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    ).encode("utf-8")
     request = urllib.request.Request(
         f"{TELEGRAM_URL}/bot{token}/sendMessage",
         data=body,
@@ -518,11 +533,10 @@ def send_telegram(message: str) -> None:
         raise RuntimeError(f"Telegram rejected message: {result}")
 
 
-def notify_new_matches(
-    new_keys: set[str], results: dict[str, dict[str, dict[str, Any]]]
+def notify_hourly_summary(
+    hourly_keys: set[str], results: dict[str, dict[str, dict[str, Any]]]
 ) -> None:
-    symbols = {key.split("|", 2)[0] for key in new_keys}
-    labels = dict(CONDITIONS)
+    symbols = {key.split("|", 2)[0] for key in hourly_keys}
     ranked = []
     for symbol in symbols:
         per_timeframe = {
@@ -536,21 +550,23 @@ def notify_new_matches(
     if not ranked:
         return
 
-    lines = ["Binance Futures — yeni, mum kapanışıyla teyitli eşleşmeler"]
+    lines = [
+        "🔥 <b>4 SAATLİK FUTURES TARAMA</b>",
+        f"⏰ Saatlik toplam · {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:52')} UTC",
+        f"📊 <b>{len(ranked)} parite / {len(CONDITIONS)} koşul</b>",
+        "━━━━━━━━━━━━━━━━",
+    ]
     for total, symbol, per_timeframe in ranked:
         display_symbol = symbol if symbol.endswith(".P") else f"{symbol}.P"
-        lines.append(f"\n{display_symbol} — {total}/{len(CONDITIONS) * len(TIMEFRAMES)} koşul")
-        for timeframe in TIMEFRAMES:
-            row = per_timeframe[timeframe]
-            if row and row["matches"]:
-                lines.append(f"{timeframe}: {', '.join(row['matches'])}")
-        newly_matched = [
-            labels.get(key.split("|", 2)[2], key.split("|", 2)[2])
-            for key in new_keys
-            if key.startswith(f"{symbol}|")
-        ]
-        if newly_matched:
-            lines.append(f"Yeni: {', '.join(newly_matched)}")
+        filled = "◆" * total
+        empty = "◇" * (len(CONDITIONS) - total)
+        row = per_timeframe["4h"]
+        matches = row["matches"] if row else []
+        lines.append(
+            f"\n<b>{display_symbol}</b>"
+            f"\n{filled}{empty} <b>{total}/7</b>"
+            f"\n✅ {', '.join(matches)}"
+        )
 
     message = ""
     for line in lines:
@@ -591,7 +607,15 @@ def run() -> int:
                     print(f"  {timeframe}: {completed}/{len(symbols)} tamamlandı")
         results_by_timeframe[timeframe] = results
 
-    previous = load_state()
+    state = load_state()
+    previous = set(state["active_conditions"])
+    current_hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+    hourly_sent_bucket = state.get("hourly_sent_bucket", "")
+    hourly_seen = (
+        set(state["hourly_seen"])
+        if state.get("hourly_bucket") == current_hour
+        else set()
+    )
     successful_contexts = {
         (timeframe, symbol)
         for timeframe, results in results_by_timeframe.items()
@@ -612,6 +636,9 @@ def run() -> int:
     }
     newly_matched = current - previous
     active = retained | current
+    hourly_seen.update(
+        key for key in current if key.split("|", 2)[1] == "4h"
+    )
 
     ranked: dict[str, tuple[int, str]] = {}
     for symbol in symbols:
@@ -639,9 +666,17 @@ def run() -> int:
         )
 
     print(f"Yeni koşul eşleşmesi: {len(newly_matched)}")
-    if newly_matched:
-        notify_new_matches(newly_matched, results_by_timeframe)
-    save_state(active)
+    if datetime.now(timezone.utc).minute >= 52 and hourly_sent_bucket != current_hour:
+        notify_hourly_summary(hourly_seen, results_by_timeframe)
+        hourly_sent_bucket = current_hour
+    else:
+        print("Saatlik özet gönderim penceresi dışında veya bu saat gönderildi.")
+    save_state({
+        "active_conditions": sorted(active),
+        "hourly_seen": sorted(hourly_seen),
+        "hourly_bucket": current_hour,
+        "hourly_sent_bucket": hourly_sent_bucket,
+    })
     if errors:
         print(f"{errors} parite/zaman diliminde veri alınamadı.")
     return 0

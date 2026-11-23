@@ -27,7 +27,7 @@ jobs:
           key: futures-state-${{ github.run_id }}
           restore-keys: futures-state-
 
-      - name: Kapalı 1s/4s mumları tara ve Telegram'a bildir
+      - name: Kapalı 4s mumlarını tara ve saatlik Telegram özeti gönder
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
