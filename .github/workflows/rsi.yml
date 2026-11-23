@@ -1,4 +1,4 @@
-name: Futures Structure Telegram Alert
+name: Bybit Futures Structure Telegram Alert
 
 on:
   schedule:

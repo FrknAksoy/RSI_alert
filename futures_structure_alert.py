@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan closed Binance USD-M futures candles and send new structure matches to Telegram."""
+"""Scan closed Bybit USDT linear perpetual candles and send structure matches to Telegram."""
 
 from __future__ import annotations
 
@@ -18,11 +18,9 @@ from pathlib import Path
 from typing import Any
 
 
-FUTURES_URLS = (
-    "https://fapi.binance.com",
-    "https://fapi1.binance.com",
-    "https://fapi2.binance.com",
-    "https://fapi3.binance.com",
+BYBIT_URLS = (
+    "https://api.bybit.com",
+    "https://api.bytick.com",
 )
 TELEGRAM_URL = "https://api.telegram.org"
 TIMEFRAMES = ("4h",)
@@ -110,25 +108,34 @@ def http_json(
 
 
 def available_symbols(pacer: RequestPacer) -> list[str]:
-    exchange_info = None
+    instruments = None
     last_error = ""
-    for base_url in FUTURES_URLS:
+    for base_url in BYBIT_URLS:
         try:
-            exchange_info = http_json(base_url, "/fapi/v1/exchangeInfo", {}, pacer)
-            break
+            response = http_json(
+                base_url,
+                "/v5/market/instruments-info",
+                {"category": "linear", "status": "Trading", "limit": 1000},
+                pacer,
+            )
+            if response.get("retCode") == 0:
+                instruments = response
+                break
         except Exception as error:
             last_error = str(error)
-    if exchange_info is None:
-        raise RuntimeError(f"Binance Futures API unavailable: {last_error}")
-    symbols = {
+    if instruments is None:
+        raise RuntimeError(f"Bybit linear instruments unavailable: {last_error}")
+
+    symbols = sorted(
         item["symbol"]
-        for item in exchange_info.get("symbols", [])
-        if item.get("status") == "TRADING"
-        and item.get("contractType") in ("PERPETUAL", "TRADIFI_PERPETUAL")
-    }
+        for item in instruments["result"]["list"]
+        if item.get("status") == "Trading"
+        and item.get("quoteCoin") == "USDT"
+        and item.get("contractType") == "LinearPerpetual"
+    )
     if not symbols:
-        raise RuntimeError("Binance returned no active USD-M perpetual contracts")
-    return sorted(symbols)
+        raise RuntimeError("Bybit returned no active USDT perpetual contracts")
+    return symbols
 
 
 def get_closed_candles(
@@ -136,21 +143,29 @@ def get_closed_candles(
 ) -> list[Candle]:
     rows = None
     last_error = ""
-    for base_url in FUTURES_URLS:
+    for base_url in BYBIT_URLS:
         try:
-            rows = http_json(
+            response = http_json(
                 base_url,
-                "/fapi/v1/klines",
-                {"symbol": symbol, "interval": timeframe, "limit": KLINE_LIMIT},
+                "/v5/market/kline",
+                {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "interval": "240",
+                    "limit": KLINE_LIMIT,
+                },
                 pacer,
             )
-            break
+            if response.get("retCode") == 0:
+                rows = response["result"]["list"]
+                break
         except Exception as error:
             last_error = str(error)
     if rows is None:
-        raise RuntimeError(f"Binance candles unavailable: {last_error}")
+        raise RuntimeError(f"Bybit candles unavailable: {last_error}")
     if len(rows) < 3:
         raise RuntimeError(f"Not enough {timeframe} candles returned")
+    rows = list(reversed(rows))
     return [
         Candle(
             open_time=int(row[0]),
@@ -574,13 +589,13 @@ def notify_hourly_summary(
         return
 
     lines = [
-        "🔥 <b>4 SAATLİK FUTURES TARAMA</b>",
+        "🔥 <b>4 SAATLİK BYBIT FUTURES TARAMA</b>",
         f"⏰ Saatlik toplam · {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:52')} UTC",
         f"📊 <b>{len(ranked)} parite / {len(CONDITIONS)} koşul</b>",
         "━━━━━━━━━━━━━━━━",
     ]
     for total, symbol, per_timeframe in ranked:
-        display_symbol = symbol if symbol.endswith(".P") else f"{symbol}.P"
+        display_symbol = symbol
         filled = "◆" * total
         empty = "◇" * (len(CONDITIONS) - total)
         row = per_timeframe["4h"]
@@ -595,7 +610,7 @@ def notify_hourly_summary(
     for line in lines:
         if len(message) + len(line) + 1 > 3800:
             send_telegram(message)
-            message = "Binance Futures — devamı\n"
+            message = "Bybit Futures — devamı\n"
         message += line + "\n"
     if message.strip():
         send_telegram(message)
@@ -607,7 +622,7 @@ def run() -> int:
 
     pacer = RequestPacer(REQUEST_INTERVAL)
     symbols = available_symbols(pacer)
-    print(f"Binance USD-M: {len(symbols)} aktif perpetual parite.")
+    print(f"Bybit linear: {len(symbols)} aktif USDT perpetual parite.")
 
     results_by_timeframe: dict[str, dict[str, dict[str, Any]]] = {}
     errors = 0
