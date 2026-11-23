@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan closed MEXC USDT perpetual candles and send structure matches to Telegram."""
+"""Scan closed Binance USD-M perpetual candles and send structure matches to Telegram."""
 
 from __future__ import annotations
 
@@ -12,14 +12,18 @@ from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
-import ccxt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-EXCHANGE_NAME = "mexc"
+BINANCE_FUTURES_URLS = (
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+)
 TELEGRAM_URL = "https://api.telegram.org"
 TIMEFRAMES = ("4h",)
 KLINE_LIMIT = 1000
@@ -105,34 +109,50 @@ def http_json(
     raise RuntimeError(f"Request failed: {path}")
 
 
-def available_symbols(pacer: RequestPacer) -> list[str]:
-    exchange = getattr(ccxt, EXCHANGE_NAME)({"enableRateLimit": True, "timeout": 20000})
-    markets = exchange.load_markets()
-    symbols = sorted(
-        market["symbol"]
-        for market in markets.values()
-        if market.get("contract")
-        and market.get("linear")
-        and market.get("quote") == "USDT"
-    )
+def binance_perpetual_symbols(pacer: RequestPacer) -> list[str]:
+    exchange_info = None
+    last_error = ""
+    for base_url in BINANCE_FUTURES_URLS:
+        try:
+            exchange_info = http_json(base_url, "/fapi/v1/exchangeInfo", {}, pacer)
+            break
+        except Exception as error:
+            last_error = str(error)
+    if exchange_info is None:
+        raise RuntimeError(f"Binance Futures API unavailable: {last_error}")
+
+    symbols = {
+        item["symbol"]
+        for item in exchange_info.get("symbols", [])
+        if item.get("status") == "TRADING"
+        and item.get("quoteAsset", item.get("quoteCoin")) == "USDT"
+        and item.get("contractType") in ("PERPETUAL", "TRADIFI_PERPETUAL")
+    }
     if not symbols:
-        raise RuntimeError("MEXC returned no active USDT-M perpetual contracts")
-    return symbols
+        raise RuntimeError("Binance returned no active USDT-M perpetual contracts")
+    return sorted(symbols)
 
 
 def get_closed_candles(
     symbol: str, timeframe: str, pacer: RequestPacer
 ) -> list[Candle]:
-    exchange = getattr(ccxt, EXCHANGE_NAME)({"enableRateLimit": True, "timeout": 20000})
-    exchange_rows = exchange.fetch_ohlcv(symbol, "4h", limit=KLINE_LIMIT)
-    if len(exchange_rows) < 3:
+    rows = None
+    last_error = ""
+    for base_url in BINANCE_FUTURES_URLS:
+        try:
+            rows = http_json(
+                base_url,
+                "/fapi/v1/klines",
+                {"symbol": symbol, "interval": timeframe, "limit": KLINE_LIMIT},
+                pacer,
+            )
+            break
+        except Exception as error:
+            last_error = str(error)
+    if rows is None:
+        raise RuntimeError(f"Binance candles unavailable: {last_error}")
+    if len(rows) < 3:
         raise RuntimeError(f"Not enough {timeframe} candles returned")
-    rows = [
-        [
-            row[0], row[1], row[2], row[3], row[4],
-        ]
-        for row in exchange_rows
-    ]
     rows.sort(key=lambda row: int(row[0]))
     if len(rows) < 3:
         raise RuntimeError(f"Not enough {timeframe} candles returned")
@@ -559,7 +579,7 @@ def notify_hourly_summary(
         return
 
     lines = [
-        "🔥 <b>4 SAATLİK MEXC FUTURES TARAMA</b>",
+        "🔥 <b>4 SAATLİK BINANCE FUTURES TARAMA</b>",
         f"⏰ Saatlik toplam · {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:52')} UTC",
         f"📊 <b>{len(ranked)} parite / {len(CONDITIONS)} koşul</b>",
         "━━━━━━━━━━━━━━━━",
@@ -580,7 +600,7 @@ def notify_hourly_summary(
     for line in lines:
         if len(message) + len(line) + 1 > 3800:
             send_telegram(message)
-            message = "MEXC Futures — devamı\n"
+            message = "Binance Futures — devamı\n"
         message += line + "\n"
     if message.strip():
         send_telegram(message)
@@ -591,8 +611,8 @@ def run() -> int:
         raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID GitHub secrets are required")
 
     pacer = RequestPacer(REQUEST_INTERVAL)
-    symbols = available_symbols(pacer)
-    print(f"MEXC: {len(symbols)} aktif USDT-M perpetual parite.")
+    symbols = binance_perpetual_symbols(pacer)
+    print(f"Binance USD-M: {len(symbols)} aktif USDT-M perpetual parite.")
 
     results_by_timeframe: dict[str, dict[str, dict[str, Any]]] = {}
     errors = 0
