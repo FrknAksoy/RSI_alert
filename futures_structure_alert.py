@@ -26,6 +26,7 @@ ATR_MULTIPLIER = 1.0
 ZIGZAG_LENGTH = 9
 FIB_FACTOR = 0.33
 MAX_ACTIVE_BU_OBS = 5
+MAX_ACTIVE_BE_OBS = 5
 MAX_ACTIVE_LIQUIDITY = 30
 WORKERS = 8
 REQUEST_INTERVAL = 0.15
@@ -33,6 +34,7 @@ STATE_FILE = Path(__file__).with_name("futures_state.json")
 CONDITIONS = (
     ("bu_ob_inside", "BU-OB İÇİNDE"),
     ("bu_ob_confirm", "BU-OB TEYİT"),
+    ("be_ob_inside", "BE-OB İÇİNDE"),
     ("choch", "CHoCH"),
     ("bos", "BOS"),
     ("ftr", "FTR BÖLGESİ"),
@@ -234,6 +236,7 @@ def scan_indicator_zones(candles: list[Candle]) -> dict[str, bool]:
     last_up_index: int | None = None
     last_down_index: int | None = None
     active_ob: list[tuple[float, float]] = []
+    active_be_ob: list[tuple[float, float]] = []
     ftr_zone: tuple[float, float] | None = None
     reversal_zone: tuple[float, float] | None = None
 
@@ -367,7 +370,19 @@ def scan_indicator_zones(candles: list[Candle]) -> dict[str, bool]:
                     active_ob.append((ob.high, ob.low))
                     active_ob = active_ob[-MAX_ACTIVE_BU_OBS:]
 
+            if bearish_msb and enough_data and h1 and l1:
+                ob_index: int | None = None
+                for candidate in range(l1.index, h1.index + 1):
+                    item = candles[candidate]
+                    if item.open < item.close:
+                        ob_index = candidate
+                if ob_index is not None:
+                    ob = candles[ob_index]
+                    active_be_ob.append((ob.high, ob.low))
+                    active_be_ob = active_be_ob[-MAX_ACTIVE_BE_OBS:]
+
         active_ob = [zone for zone in active_ob if candle.close >= zone[1]]
+        active_be_ob = [zone for zone in active_be_ob if candle.close <= zone[0]]
 
     current = candles[-1]
     previous_close = candles[-2].close if len(candles) > 1 else current.close
@@ -390,9 +405,17 @@ def scan_indicator_zones(candles: list[Candle]) -> dict[str, bool]:
         ):
             bu_ob_confirm = True
 
+    in_be_ob = False
+    for top, bottom in active_be_ob:
+        came_from_below = previous_close < bottom
+        close_inside = bottom <= current.close <= top
+        if came_from_below and close_inside:
+            in_be_ob = True
+
     return {
         "bu_ob_inside": in_bu_ob,
         "bu_ob_confirm": bu_ob_confirm,
+        "be_ob_inside": in_be_ob,
         "ftr": ftr_zone is not None and ftr_zone[1] <= current.close <= ftr_zone[0],
         "reversal": reversal_zone is not None
         and reversal_zone[1] <= current.close <= reversal_zone[0],
@@ -410,6 +433,7 @@ def scan_pair(
         conditions = {
             "bu_ob_inside": zones["bu_ob_inside"],
             "bu_ob_confirm": zones["bu_ob_confirm"],
+            "be_ob_inside": zones["be_ob_inside"],
             "choch": bool(
                 current_event
                 and current_event["direction"] == "bullish"
@@ -515,7 +539,7 @@ def notify_new_matches(
     lines = ["Binance Futures — yeni, mum kapanışıyla teyitli eşleşmeler"]
     for total, symbol, per_timeframe in ranked:
         display_symbol = symbol if symbol.endswith(".P") else f"{symbol}.P"
-        lines.append(f"\n{display_symbol} — {total}/12 koşul")
+        lines.append(f"\n{display_symbol} — {total}/{len(CONDITIONS) * len(TIMEFRAMES)} koşul")
         for timeframe in TIMEFRAMES:
             row = per_timeframe[timeframe]
             if row and row["matches"]:
@@ -609,7 +633,10 @@ def run() -> int:
         sorted(ranked.items(), key=lambda item: (-item[1][0], item[0])), start=1
     ):
         display_symbol = symbol if symbol.endswith(".P") else f"{symbol}.P"
-        print(f"{rank}. {display_symbol} — {count}/12 koşul | {details}")
+        print(
+            f"{rank}. {display_symbol} — {count}/{len(CONDITIONS) * len(TIMEFRAMES)} "
+            f"koşul | {details}"
+        )
 
     print(f"Yeni koşul eşleşmesi: {len(newly_matched)}")
     if newly_matched:
