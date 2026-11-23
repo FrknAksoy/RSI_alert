@@ -565,7 +565,7 @@ def notify_hourly_summary(
         "━━━━━━━━━━━━━━━━",
     ]
     for total, symbol, per_timeframe in ranked:
-        display_symbol = symbol
+        display_symbol = symbol.split("/", 1)[0]
         filled = "◆" * total
         empty = "◇" * (len(CONDITIONS) - total)
         row = per_timeframe["4h"]
@@ -667,7 +667,7 @@ def run() -> int:
     for rank, (symbol, (count, details)) in enumerate(
         sorted(ranked.items(), key=lambda item: (-item[1][0], item[0])), start=1
     ):
-        display_symbol = symbol if symbol.endswith(".P") else f"{symbol}.P"
+        display_symbol = symbol.split("/", 1)[0]
         print(
             f"{rank}. {display_symbol} — {count}/{len(CONDITIONS) * len(TIMEFRAMES)} "
             f"koşul | {details}"
