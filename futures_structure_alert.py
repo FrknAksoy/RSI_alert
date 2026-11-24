@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan closed Binance USD-M perpetual candles and send structure matches to Telegram."""
+"""Scan Binance-listed symbols on MEXC USDT perpetuals and alert on structure matches."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
+import ccxt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,7 @@ CONDITIONS = (
     ("ftr", "FTR BÖLGESİ"),
     ("reversal", "REVERSAL BÖLGESİ"),
 )
+_MEXC_THREAD_LOCAL = threading.local()
 
 
 @dataclass(frozen=True)
@@ -133,29 +135,69 @@ def binance_perpetual_symbols(pacer: RequestPacer) -> list[str]:
     return sorted(symbols)
 
 
+def mexc_exchange(pacer: RequestPacer) -> Any:
+    exchange = getattr(_MEXC_THREAD_LOCAL, "exchange", None)
+    if exchange is None:
+        exchange = ccxt.mexc({"enableRateLimit": True, "timeout": 20000})
+        pacer.wait()
+        exchange.load_markets()
+        _MEXC_THREAD_LOCAL.exchange = exchange
+    return exchange
+
+
+def match_mexc_symbols(
+    binance_symbols: list[str], markets: dict[str, dict[str, Any]]
+) -> dict[str, str]:
+    mexc_symbols_by_ticker: dict[str, list[str]] = {}
+    for market in markets.values():
+        if not (
+            market.get("active") is True
+            and market.get("contract") is True
+            and market.get("swap") is True
+            and market.get("linear") is True
+            and market.get("quote") == "USDT"
+        ):
+            continue
+
+        base_id = market.get("baseId")
+        quote_id = market.get("quoteId")
+        symbol = market.get("symbol")
+        if not all(
+            isinstance(value, str) and value
+            for value in (base_id, quote_id, symbol)
+        ):
+            continue
+
+        ticker = f"{base_id.upper()}{quote_id.upper()}"
+        mexc_symbols_by_ticker.setdefault(ticker, []).append(symbol)
+
+    return {
+        ticker: mexc_symbols_by_ticker[ticker][0]
+        for ticker in sorted(set(binance_symbols))
+        if len(mexc_symbols_by_ticker.get(ticker, [])) == 1
+    }
+
+
+def available_symbols(
+    pacer: RequestPacer,
+) -> tuple[list[str], dict[str, str]]:
+    binance_symbols = binance_perpetual_symbols(pacer)
+    exchange = mexc_exchange(pacer)
+    mexc_markets = exchange.load_markets()
+    symbol_map = match_mexc_symbols(binance_symbols, mexc_markets)
+    return binance_symbols, symbol_map
+
+
 def get_closed_candles(
     symbol: str, timeframe: str, pacer: RequestPacer
 ) -> list[Candle]:
-    rows = None
-    last_error = ""
-    for base_url in BINANCE_FUTURES_URLS:
-        try:
-            rows = http_json(
-                base_url,
-                "/fapi/v1/klines",
-                {"symbol": symbol, "interval": timeframe, "limit": KLINE_LIMIT},
-                pacer,
-            )
-            break
-        except Exception as error:
-            last_error = str(error)
-    if rows is None:
-        raise RuntimeError(f"Binance candles unavailable: {last_error}")
-    if len(rows) < 3:
+    exchange = mexc_exchange(pacer)
+    pacer.wait()
+    exchange_rows = exchange.fetch_ohlcv(symbol, timeframe, limit=KLINE_LIMIT)
+    if len(exchange_rows) < 3:
         raise RuntimeError(f"Not enough {timeframe} candles returned")
+    rows = [row[:5] for row in exchange_rows]
     rows.sort(key=lambda row: int(row[0]))
-    if len(rows) < 3:
-        raise RuntimeError(f"Not enough {timeframe} candles returned")
     return [
         Candle(
             open_time=int(row[0]),
@@ -452,10 +494,10 @@ def scan_indicator_zones(candles: list[Candle]) -> dict[str, bool]:
 
 
 def scan_pair(
-    symbol: str, timeframe: str, pacer: RequestPacer
+    symbol: str, timeframe: str, pacer: RequestPacer, market_symbol: str | None = None
 ) -> dict[str, Any]:
     try:
-        candles = get_closed_candles(symbol, timeframe, pacer)
+        candles = get_closed_candles(market_symbol or symbol, timeframe, pacer)
         structure = scan_structure(candles)["event"]
         zones = scan_indicator_zones(candles)
         current_event = structure if structure and structure["bars_ago"] == 0 else None
@@ -579,13 +621,13 @@ def notify_hourly_summary(
         return
 
     lines = [
-        "🔥 <b>4 SAATLİK BINANCE FUTURES TARAMA</b>",
+        "🔥 <b>4 SAATLİK MEXC FUTURES TARAMA</b>",
         f"⏰ Saatlik toplam · {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:52')} UTC",
         f"📊 <b>{len(ranked)} parite / {len(CONDITIONS)} koşul</b>",
         "━━━━━━━━━━━━━━━━",
     ]
     for total, symbol, per_timeframe in ranked:
-        display_symbol = symbol.split("/", 1)[0]
+        display_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
         filled = "◆" * total
         empty = "◇" * (len(CONDITIONS) - total)
         row = per_timeframe["4h"]
@@ -600,7 +642,7 @@ def notify_hourly_summary(
     for line in lines:
         if len(message) + len(line) + 1 > 3800:
             send_telegram(message)
-            message = "Binance Futures — devamı\n"
+            message = "MEXC Futures — devamı\n"
         message += line + "\n"
     if message.strip():
         send_telegram(message)
@@ -611,8 +653,13 @@ def run() -> int:
         raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID GitHub secrets are required")
 
     pacer = RequestPacer(REQUEST_INTERVAL)
-    symbols = binance_perpetual_symbols(pacer)
-    print(f"Binance USD-M: {len(symbols)} aktif USDT-M perpetual parite.")
+    symbols, mexc_symbol_map = available_symbols(pacer)
+    scan_symbols = sorted(mexc_symbol_map)
+    print(f"Binance USD-M listesi: {len(symbols)} aktif USDT-M perpetual parite.")
+    print(
+        f"MEXC'de taranacak: {len(scan_symbols)}/{len(symbols)}; "
+        f"{len(symbols) - len(scan_symbols)} paritenin MEXC karşılığı yok, atlandı."
+    )
 
     results_by_timeframe: dict[str, dict[str, dict[str, Any]]] = {}
     errors = 0
@@ -621,8 +668,10 @@ def run() -> int:
         results: dict[str, dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=WORKERS) as executor:
             futures = {
-                executor.submit(scan_pair, symbol, timeframe, pacer): symbol
-                for symbol in symbols
+                executor.submit(
+                    scan_pair, symbol, timeframe, pacer, mexc_symbol_map[symbol]
+                ): symbol
+                for symbol in scan_symbols
             }
             for completed, future in enumerate(as_completed(futures), start=1):
                 result = future.result()
@@ -631,8 +680,8 @@ def run() -> int:
                     print(f"  Hata {result['symbol']} {timeframe}: {result['error']}")
                 else:
                     results[result["symbol"]] = result
-                if completed % 100 == 0 or completed == len(symbols):
-                    print(f"  {timeframe}: {completed}/{len(symbols)} tamamlandı")
+                if completed % 100 == 0 or completed == len(scan_symbols):
+                    print(f"  {timeframe}: {completed}/{len(scan_symbols)} tamamlandı")
         results_by_timeframe[timeframe] = results
 
     state = load_state()
@@ -683,11 +732,14 @@ def run() -> int:
             )
             ranked[symbol] = (count, details)
 
-    print(f"\nBirleşik tarama: {len(symbols)} parite; {len(ranked)} eşleşme.")
+    print(
+        f"\nBirleşik tarama: {len(scan_symbols)}/{len(symbols)} Binance paritesi; "
+        f"{len(ranked)} eşleşme."
+    )
     for rank, (symbol, (count, details)) in enumerate(
         sorted(ranked.items(), key=lambda item: (-item[1][0], item[0])), start=1
     ):
-        display_symbol = symbol.split("/", 1)[0]
+        display_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
         print(
             f"{rank}. {display_symbol} — {count}/{len(CONDITIONS) * len(TIMEFRAMES)} "
             f"koşul | {details}"
