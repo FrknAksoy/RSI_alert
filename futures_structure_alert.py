@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import sys
@@ -38,6 +39,7 @@ MAX_ACTIVE_LIQUIDITY = 30
 WORKERS = 8
 REQUEST_INTERVAL = 0.15
 STATE_FILE = Path(__file__).with_name("futures_state.json")
+HTML_REPORT_FILE = Path(__file__).with_name("futures_report.html")
 CONDITIONS = (
     ("bu_ob_inside", "BU-OB İÇİNDE"),
     ("bu_ob_confirm", "BU-OB TEYİT"),
@@ -696,6 +698,135 @@ def notify_hourly_summary(
         send_telegram(message)
 
 
+def write_html_report(
+    symbols: list[str],
+    results_by_timeframe: dict[str, dict[str, dict[str, Any]]],
+    scan_errors: dict[tuple[str, str], str],
+    generated_at: datetime | None = None,
+    output_path: Path = HTML_REPORT_FILE,
+) -> None:
+    generated_at = generated_at or datetime.now(timezone.utc)
+    rows: list[str] = []
+    successful_count = 0
+    signal_count = 0
+    fallback_count = 0
+    error_count = 0
+
+    for symbol in symbols:
+        for timeframe in TIMEFRAMES:
+            result = results_by_timeframe.get(timeframe, {}).get(symbol)
+            error = scan_errors.get((timeframe, symbol), "")
+            if result:
+                successful_count += 1
+                matches = result["matches"]
+                signal_count += bool(matches)
+                fallback_count += result["data_source"] == "MEXC yedek"
+                status = "Sinyal var" if matches else "Sinyal yok"
+                status_class = "signal" if matches else "clear"
+                source = result["data_source"]
+                price = f'{float(result["price"]):,.8g}'
+                conditions = result["conditions"]
+                candle_time = datetime.fromtimestamp(
+                    result["candle"] / 1000, tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M UTC")
+                match_labels = ", ".join(matches) if matches else "—"
+            else:
+                error_count += 1
+                status = "Veri alınamadı"
+                status_class = "error"
+                source = "—"
+                price = "—"
+                conditions = {}
+                candle_time = "—"
+                match_labels = error or "Tarama sonucu yok"
+
+            condition_cells = "".join(
+                '<td class="condition '
+                + ("active" if conditions.get(key) else "")
+                + '">'
+                + ("✓" if conditions.get(key) else "—")
+                + "</td>"
+                for key, _ in CONDITIONS
+            )
+            rows.append(
+                f'<tr data-status="{status_class}">'
+                f"<td><strong>{html.escape(symbol)}</strong></td>"
+                f"<td>{html.escape(timeframe)}</td>"
+                f'<td><span class="badge {status_class}">{html.escape(status)}</span></td>'
+                f"<td>{html.escape(source)}</td>"
+                f"<td>{html.escape(price)}</td>"
+                f"<td>{html.escape(candle_time)}</td>"
+                f"<td>{html.escape(match_labels)}</td>"
+                f"{condition_cells}</tr>"
+            )
+
+    template = """<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Binance Futures Tarama Raporu</title>
+<style>
+:root{color-scheme:light dark;font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+body{margin:0;background:#f6f8fa;color:#1f2328}
+main{max-width:1600px;margin:0 auto;padding:24px}
+h1{margin:0 0 6px;font-size:1.7rem}.muted{color:#656d76}
+.summary{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0}
+.card{background:white;border:1px solid #d1d9e0;border-radius:8px;padding:12px 16px;min-width:125px}
+.card strong{display:block;font-size:1.35rem}
+.controls{display:flex;gap:10px;margin:16px 0}
+input,select{padding:9px 11px;border:1px solid #d1d9e0;border-radius:6px;background:white;color:inherit}
+input{min-width:240px;flex:1}
+.table-wrap{overflow:auto;background:white;border:1px solid #d1d9e0;border-radius:8px}
+table{border-collapse:collapse;width:100%;min-width:1250px}
+th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #d8dee4;white-space:nowrap}
+th{position:sticky;top:0;background:#f6f8fa;z-index:1}
+tbody tr:hover{background:#f6f8fa}.badge{padding:3px 8px;border-radius:12px;font-size:.85rem}
+.badge.signal{background:#dafbe1;color:#116329}.badge.clear{background:#ddf4ff;color:#0550ae}
+.badge.error{background:#ffebe9;color:#cf222e}.condition{text-align:center;color:#8c959f}
+.condition.active{background:#dafbe1;color:#116329;font-weight:bold}
+@media(prefers-color-scheme:dark){body{background:#0d1117;color:#e6edf3}.card,.table-wrap{background:#161b22;border-color:#30363d}th,input,select{background:#161b22;border-color:#30363d;color:#e6edf3}th{background:#21262d}th,td{border-color:#30363d}tbody tr:hover{background:#21262d}.muted{color:#8b949e}}
+</style>
+</head>
+<body><main>
+<h1>Binance Futures tarama raporu</h1>
+<div class="muted">Oluşturulma: __GENERATED_AT__ · Kaynak evren: aktif Binance USDⓈ-M USDT perpetual pariteleri · MEXC yalnızca Binance verisi alınamadığında yedektir.</div>
+<section class="summary">
+<div class="card"><strong>__SYMBOL_COUNT__</strong>Binance paritesi</div>
+<div class="card"><strong>__SUCCESS_COUNT__</strong>Başarılı tarama</div>
+<div class="card"><strong>__SIGNAL_COUNT__</strong>Sinyalli parite</div>
+<div class="card"><strong>__FALLBACK_COUNT__</strong>MEXC yedek</div>
+<div class="card"><strong>__ERROR_COUNT__</strong>Veri alınamayan</div>
+</section>
+<div class="controls">
+<input id="search" type="search" placeholder="Sembol veya sinyal ara">
+<select id="status"><option value="">Tüm durumlar</option><option value="signal">Sinyal var</option><option value="clear">Sinyal yok</option><option value="error">Veri alınamadı</option></select>
+</div>
+<div class="table-wrap"><table>
+<thead><tr><th>Parite</th><th>Zaman</th><th>Durum</th><th>Veri kaynağı</th><th>Son fiyat</th><th>Son kapanış</th><th>Sinyaller</th>__CONDITION_HEADERS__</tr></thead>
+<tbody id="results">__ROWS__</tbody>
+</table></div>
+</main>
+<script>
+const search=document.getElementById("search"),status=document.getElementById("status");
+function filterRows(){const q=search.value.toLocaleLowerCase("tr"),s=status.value;for(const row of document.querySelectorAll("#results tr")){row.hidden=(s&&row.dataset.status!==s)||!row.textContent.toLocaleLowerCase("tr").includes(q)}}
+search.addEventListener("input",filterRows);status.addEventListener("change",filterRows);
+</script>
+</body></html>"""
+    headers = "".join(f"<th>{html.escape(label)}</th>" for _, label in CONDITIONS)
+    report = (
+        template.replace("__GENERATED_AT__", html.escape(generated_at.strftime("%Y-%m-%d %H:%M UTC")))
+        .replace("__SYMBOL_COUNT__", str(len(symbols)))
+        .replace("__SUCCESS_COUNT__", str(successful_count))
+        .replace("__SIGNAL_COUNT__", str(signal_count))
+        .replace("__FALLBACK_COUNT__", str(fallback_count))
+        .replace("__ERROR_COUNT__", str(error_count))
+        .replace("__CONDITION_HEADERS__", headers)
+        .replace("__ROWS__", "".join(rows))
+    )
+    output_path.write_text(report, encoding="utf-8")
+
+
 def run() -> int:
     if not os.environ.get("TELEGRAM_TOKEN") or not os.environ.get("TELEGRAM_CHAT_ID"):
         raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID GitHub secrets are required")
@@ -711,6 +842,7 @@ def run() -> int:
         print(f"MEXC yedeği kullanılamıyor; Binance taraması sürecek: {error}")
 
     results_by_timeframe: dict[str, dict[str, dict[str, Any]]] = {}
+    scan_errors: dict[tuple[str, str], str] = {}
     errors = 0
     data_source_counts = {"Binance": 0, "MEXC yedek": 0}
     for timeframe in TIMEFRAMES:
@@ -727,6 +859,7 @@ def run() -> int:
                 result = future.result()
                 if result["error"]:
                     errors += 1
+                    scan_errors[(timeframe, result["symbol"])] = result["error"]
                     print(f"  Hata {result['symbol']} {timeframe}: {result['error']}")
                 else:
                     results[result["symbol"]] = result
@@ -734,6 +867,9 @@ def run() -> int:
                 if completed % 100 == 0 or completed == len(symbols):
                     print(f"  {timeframe}: {completed}/{len(symbols)} tamamlandı")
         results_by_timeframe[timeframe] = results
+
+    write_html_report(symbols, results_by_timeframe, scan_errors)
+    print(f"HTML tarama raporu yazıldı: {HTML_REPORT_FILE}")
 
     state = load_state()
     previous = set(state["active_conditions"])

@@ -1,4 +1,7 @@
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import ANY, call, patch
 
 import futures_structure_alert as scanner
@@ -69,6 +72,57 @@ class BinancePerpetualSymbolsTests(unittest.TestCase):
             scanner.binance_perpetual_symbols(scanner.RequestPacer(0)),
             ["BTCUSDT", "ETHUSDT"],
         )
+
+
+class HtmlReportTests(unittest.TestCase):
+    def test_writes_standalone_report_with_signals_errors_and_escaped_symbols(self) -> None:
+        symbol = "BTC<script>alert(1)</script>USDT"
+        conditions = {key: key == "bos" for key, _ in scanner.CONDITIONS}
+        results = {
+            "4h": {
+                symbol: {
+                    "symbol": symbol,
+                    "timeframe": "4h",
+                    "candle": 1_000,
+                    "price": 123.45,
+                    "conditions": conditions,
+                    "matches": ["BOS"],
+                    "data_source": "MEXC yedek",
+                },
+                "QUIETUSDT": {
+                    "symbol": "QUIETUSDT",
+                    "timeframe": "4h",
+                    "candle": 1_000,
+                    "price": 0.25,
+                    "conditions": {key: False for key, _ in scanner.CONDITIONS},
+                    "matches": [],
+                    "data_source": "Binance",
+                },
+            }
+        }
+        errors = {("4h", "BADUSDT"): "HTTP <unavailable>"}
+
+        with TemporaryDirectory() as directory:
+            output_path = Path(directory) / "report.html"
+            scanner.write_html_report(
+                [symbol, "BADUSDT", "QUIETUSDT"],
+                results,
+                errors,
+                datetime(2026, 11, 25, 10, 0, tzinfo=timezone.utc),
+                output_path,
+            )
+            report = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("3</strong>Binance paritesi", report)
+        self.assertIn("2</strong>Başarılı tarama", report)
+        self.assertIn("1</strong>Sinyalli parite", report)
+        self.assertIn("1</strong>MEXC yedek", report)
+        self.assertIn("1</strong>Veri alınamayan", report)
+        self.assertIn("BTC&lt;script&gt;alert(1)&lt;/script&gt;USDT", report)
+        self.assertNotIn("<td><strong>BTC<script>", report)
+        self.assertIn("HTTP &lt;unavailable&gt;", report)
+        self.assertIn('data-status="clear"', report)
+        self.assertIn("MEXC yedek", report)
 
 
 class MexcFallbackMarketTests(unittest.TestCase):
