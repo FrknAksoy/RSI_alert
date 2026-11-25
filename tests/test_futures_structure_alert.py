@@ -73,6 +73,24 @@ class BinancePerpetualSymbolsTests(unittest.TestCase):
             ["BTCUSDT", "ETHUSDT"],
         )
 
+    @patch.object(
+        scanner,
+        "http_json",
+        side_effect=RuntimeError("Binance API unavailable"),
+    )
+    def test_uses_checked_in_snapshot_if_binance_api_is_unavailable(
+        self, _http_json
+    ) -> None:
+        with patch.object(
+            scanner,
+            "BINANCE_SYMBOL_SNAPSHOT_FILE",
+            new=Path(__file__).parent.parent / "binance_usdt_perpetuals.txt",
+        ):
+            symbols = scanner.binance_perpetual_symbols(scanner.RequestPacer(0))
+
+        self.assertGreater(len(symbols), 500)
+        self.assertIn("BTCUSDT", symbols)
+
 
 class HtmlReportTests(unittest.TestCase):
     def test_writes_standalone_report_with_signals_errors_and_escaped_symbols(self) -> None:
