@@ -53,6 +53,7 @@ CONDITIONS = (
     ("reversal", "REVERSAL BÖLGESİ"),
 )
 _MEXC_THREAD_LOCAL = threading.local()
+BINANCE_MARKET_DATA_AVAILABLE = True
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,7 @@ def http_json(
 
 
 def binance_perpetual_symbols(pacer: RequestPacer) -> list[str]:
+    global BINANCE_MARKET_DATA_AVAILABLE
     exchange_info = None
     last_error = ""
     for base_url in BINANCE_FUTURES_URLS:
@@ -126,6 +128,7 @@ def binance_perpetual_symbols(pacer: RequestPacer) -> list[str]:
         except Exception as error:
             last_error = str(error)
     if exchange_info is not None:
+        BINANCE_MARKET_DATA_AVAILABLE = True
         symbols = {
             item["symbol"]
             for item in exchange_info.get("symbols", [])
@@ -134,6 +137,7 @@ def binance_perpetual_symbols(pacer: RequestPacer) -> list[str]:
             and item.get("contractType") in ("PERPETUAL", "TRADIFI_PERPETUAL")
         }
     else:
+        BINANCE_MARKET_DATA_AVAILABLE = False
         symbols = set()
 
     if not symbols:
@@ -243,17 +247,20 @@ def get_closed_candles(
     mexc_symbol: str | None = None,
 ) -> tuple[list[Candle], str]:
     binance_errors: list[str] = []
-    for base_url in BINANCE_FUTURES_URLS:
-        try:
-            rows = http_json(
-                base_url,
-                "/fapi/v1/klines",
-                {"symbol": symbol, "interval": timeframe, "limit": KLINE_LIMIT},
-                pacer,
-            )
-            return closed_candles_from_rows(rows, timeframe), "Binance"
-        except Exception as error:
-            binance_errors.append(f"{base_url}: {error}")
+    if BINANCE_MARKET_DATA_AVAILABLE:
+        for base_url in BINANCE_FUTURES_URLS:
+            try:
+                rows = http_json(
+                    base_url,
+                    "/fapi/v1/klines",
+                    {"symbol": symbol, "interval": timeframe, "limit": KLINE_LIMIT},
+                    pacer,
+                )
+                return closed_candles_from_rows(rows, timeframe), "Binance"
+            except Exception as error:
+                binance_errors.append(f"{base_url}: {error}")
+    else:
+        binance_errors.append("Binance exchangeInfo unavailable; snapshot mode")
 
     binance_error = "; ".join(binance_errors)
     if not mexc_symbol:
@@ -864,6 +871,14 @@ def run() -> int:
     except Exception as error:
         mexc_symbols = {}
         print(f"MEXC yedeği kullanılamıyor; Binance taraması sürecek: {error}")
+    if not BINANCE_MARKET_DATA_AVAILABLE:
+        scan_symbols = sorted(mexc_symbols)
+        print(
+            f"Snapshot modu: sadece MEXC'de birebir eşleşen "
+            f"{len(scan_symbols)} parite taranacak."
+        )
+    else:
+        scan_symbols = symbols
 
     results_by_timeframe: dict[str, dict[str, dict[str, Any]]] = {}
     scan_errors: dict[tuple[str, str], str] = {}
@@ -877,7 +892,7 @@ def run() -> int:
                 executor.submit(
                     scan_pair, symbol, timeframe, pacer, mexc_symbols.get(symbol)
                 ): symbol
-                for symbol in symbols
+                for symbol in scan_symbols
             }
             for completed, future in enumerate(as_completed(futures), start=1):
                 result = future.result()

@@ -90,6 +90,7 @@ class BinancePerpetualSymbolsTests(unittest.TestCase):
 
         self.assertGreater(len(symbols), 500)
         self.assertIn("BTCUSDT", symbols)
+        self.assertFalse(scanner.BINANCE_MARKET_DATA_AVAILABLE)
 
 
 class HtmlReportTests(unittest.TestCase):
