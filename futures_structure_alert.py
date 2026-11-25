@@ -36,8 +36,8 @@ FIB_FACTOR = 0.33
 MAX_ACTIVE_BU_OBS = 5
 MAX_ACTIVE_BE_OBS = 5
 MAX_ACTIVE_LIQUIDITY = 30
-WORKERS = 8
-REQUEST_INTERVAL = 0.15
+WORKERS = 4
+REQUEST_INTERVAL = 0.35
 STATE_FILE = Path(__file__).with_name("futures_state.json")
 HTML_REPORT_FILE = Path(__file__).with_name("futures_report.html")
 BINANCE_SYMBOL_SNAPSHOT_FILE = Path(__file__).with_name(
@@ -168,7 +168,7 @@ def binance_perpetual_symbols(pacer: RequestPacer) -> list[str]:
 def mexc_exchange(pacer: RequestPacer) -> Any:
     exchange = getattr(_MEXC_THREAD_LOCAL, "exchange", None)
     if exchange is None:
-        exchange = ccxt.mexc({"enableRateLimit": True, "timeout": 20000})
+        exchange = ccxt.mexc({"enableRateLimit": True, "timeout": 10000})
         pacer.wait()
         exchange.load_markets()
         _MEXC_THREAD_LOCAL.exchange = exchange
