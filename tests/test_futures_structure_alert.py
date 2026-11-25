@@ -4,6 +4,27 @@ from unittest.mock import ANY, call, patch
 import futures_structure_alert as scanner
 
 
+def mexc_market(
+    symbol: str,
+    base_id: str,
+    *,
+    active: bool = True,
+    contract: bool = True,
+    swap: bool = True,
+    linear: bool = True,
+) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "baseId": base_id,
+        "quoteId": "USDT",
+        "quote": "USDT",
+        "active": active,
+        "contract": contract,
+        "swap": swap,
+        "linear": linear,
+    }
+
+
 class BinancePerpetualSymbolsTests(unittest.TestCase):
     @patch.object(
         scanner,
@@ -50,6 +71,39 @@ class BinancePerpetualSymbolsTests(unittest.TestCase):
         )
 
 
+class MexcFallbackMarketTests(unittest.TestCase):
+    def test_only_maps_active_mexc_perpetuals_in_binance_universe(self) -> None:
+        markets = {
+            "btc": mexc_market("BTC/USDT:USDT", "BTC"),
+            "inactive": mexc_market("ETH/USDT:USDT", "ETH", active=False),
+            "future": mexc_market("SOL/USDT:USDT", "SOL", swap=False),
+            "inverse": mexc_market("ADA/USDT:USDT", "ADA", linear=False),
+            "mexc-only": mexc_market("AMDSTOCK/USDT:USDT", "AMDSTOCK"),
+        }
+
+        self.assertEqual(
+            scanner.match_mexc_symbols(["BTCUSDT", "ETHUSDT"], markets),
+            {"BTCUSDT": "BTC/USDT:USDT"},
+        )
+
+    def test_available_source_list_stays_binance_list(self) -> None:
+        binance_symbols = ["BTCUSDT", "NOTONMEXCUSDT"]
+
+        with (
+            patch.object(
+                scanner, "binance_perpetual_symbols", return_value=binance_symbols
+            ),
+            patch.object(scanner, "mexc_symbol_map", return_value={"BTCUSDT": "BTC/USDT:USDT"}),
+        ):
+            symbols, fallback_map = scanner.available_symbols(
+                scanner.RequestPacer(0)
+            )
+
+        self.assertEqual(symbols, binance_symbols)
+        self.assertNotIn("AMDSTOCKUSDT", symbols)
+        self.assertEqual(fallback_map, {"BTCUSDT": "BTC/USDT:USDT"})
+
+
 class BinanceCandleTests(unittest.TestCase):
     def test_loads_4h_candles_and_excludes_the_open_candle(self) -> None:
         rows = [
@@ -59,12 +113,13 @@ class BinanceCandleTests(unittest.TestCase):
         ]
 
         with patch.object(scanner, "http_json", return_value=rows) as request:
-            candles = scanner.get_closed_candles(
+            candles, source = scanner.get_closed_candles(
                 "BTCUSDT", "4h", scanner.RequestPacer(0)
             )
 
         self.assertEqual([candle.open_time for candle in candles], [1000, 2000])
         self.assertEqual(candles[0].close, 2.0)
+        self.assertEqual(source, "Binance")
         request.assert_called_once_with(
             scanner.BINANCE_FUTURES_URLS[0],
             "/fapi/v1/klines",
@@ -84,8 +139,12 @@ class BinanceCandleTests(unittest.TestCase):
             "http_json",
             side_effect=[RuntimeError("primary unavailable"), rows],
         ) as request:
-            scanner.get_closed_candles("BTCUSDT", "4h", scanner.RequestPacer(0))
+            candles, source = scanner.get_closed_candles(
+                "BTCUSDT", "4h", scanner.RequestPacer(0)
+            )
 
+        self.assertEqual(len(candles), 2)
+        self.assertEqual(source, "Binance")
         self.assertEqual(
             request.call_args_list,
             [
@@ -103,6 +162,85 @@ class BinanceCandleTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_uses_mexc_only_after_all_binance_hosts_fail(self) -> None:
+        rows = [
+            [1000, 1, 3, 0.5, 2, 10],
+            [2000, 2, 4, 1.5, 3, 10],
+            [3000, 3, 5, 2.5, 4, 10],
+        ]
+        exchange = unittest.mock.Mock()
+        exchange.fetch_ohlcv.return_value = rows
+
+        with (
+            patch.object(
+                scanner,
+                "http_json",
+                side_effect=RuntimeError("Binance unavailable"),
+            ),
+            patch.object(scanner, "mexc_exchange", return_value=exchange),
+        ):
+            candles, source = scanner.get_closed_candles(
+                "BTCUSDT", "4h", scanner.RequestPacer(0), "BTC/USDT:USDT"
+            )
+
+        self.assertEqual([candle.open_time for candle in candles], [1000, 2000])
+        self.assertEqual(source, "MEXC yedek")
+        exchange.fetch_ohlcv.assert_called_once_with(
+            "BTC/USDT:USDT", "4h", limit=scanner.KLINE_LIMIT
+        )
+
+    def test_does_not_use_mexc_only_symbols_as_fallback(self) -> None:
+        with (
+            patch.object(
+                scanner,
+                "http_json",
+                side_effect=RuntimeError("Binance unavailable"),
+            ),
+            patch.object(scanner, "mexc_exchange") as make_exchange,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "no matching MEXC USDT perpetual market"
+            ):
+                scanner.get_closed_candles(
+                    "NOTONBINANCEUSDT", "4h", scanner.RequestPacer(0)
+                )
+
+        make_exchange.assert_not_called()
+
+    def test_scan_keeps_binance_ticker_for_mexc_fallback_candles(self) -> None:
+        candles = [
+            scanner.Candle(1000, 1, 2, 0.5, 1.5),
+            scanner.Candle(2000, 1.5, 2, 1, 1.8),
+            scanner.Candle(3000, 1.8, 2, 1.2, 1.9),
+        ]
+        zones = {
+            "bu_ob_inside": False,
+            "bu_ob_confirm": False,
+            "be_ob_inside": False,
+            "ftr": False,
+            "reversal": False,
+        }
+
+        with (
+            patch.object(
+                scanner,
+                "get_closed_candles",
+                return_value=(candles, "MEXC yedek"),
+            ) as get_candles,
+            patch.object(scanner, "scan_structure", return_value={"event": None}),
+            patch.object(scanner, "scan_indicator_zones", return_value=zones),
+        ):
+            result = scanner.scan_pair(
+                "BTCUSDT", "4h", scanner.RequestPacer(0), "BTC/USDT:USDT"
+            )
+
+        get_candles.assert_called_once_with(
+            "BTCUSDT", "4h", unittest.mock.ANY, "BTC/USDT:USDT"
+        )
+        self.assertEqual(result["symbol"], "BTCUSDT")
+        self.assertEqual(result["data_source"], "MEXC yedek")
+        self.assertEqual(result["error"], "")
 
 
 if __name__ == "__main__":

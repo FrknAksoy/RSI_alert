@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
+import ccxt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,7 @@ CONDITIONS = (
     ("ftr", "FTR BÖLGESİ"),
     ("reversal", "REVERSAL BÖLGESİ"),
 )
+_MEXC_THREAD_LOCAL = threading.local()
 
 
 @dataclass(frozen=True)
@@ -133,29 +135,69 @@ def binance_perpetual_symbols(pacer: RequestPacer) -> list[str]:
     return sorted(symbols)
 
 
-def get_closed_candles(
-    symbol: str, timeframe: str, pacer: RequestPacer
-) -> list[Candle]:
-    rows = None
-    last_error = ""
-    for base_url in BINANCE_FUTURES_URLS:
-        try:
-            rows = http_json(
-                base_url,
-                "/fapi/v1/klines",
-                {"symbol": symbol, "interval": timeframe, "limit": KLINE_LIMIT},
-                pacer,
-            )
-            break
-        except Exception as error:
-            last_error = str(error)
-    if rows is None:
-        raise RuntimeError(f"Binance candles unavailable: {last_error}")
+def mexc_exchange(pacer: RequestPacer) -> Any:
+    exchange = getattr(_MEXC_THREAD_LOCAL, "exchange", None)
+    if exchange is None:
+        exchange = ccxt.mexc({"enableRateLimit": True, "timeout": 20000})
+        pacer.wait()
+        exchange.load_markets()
+        _MEXC_THREAD_LOCAL.exchange = exchange
+    return exchange
+
+
+def match_mexc_symbols(
+    binance_symbols: list[str], markets: dict[str, dict[str, Any]]
+) -> dict[str, str]:
+    mexc_symbols_by_ticker: dict[str, list[str]] = {}
+    for market in markets.values():
+        if not (
+            market.get("active") is True
+            and market.get("contract") is True
+            and market.get("swap") is True
+            and market.get("linear") is True
+            and market.get("quote") == "USDT"
+        ):
+            continue
+
+        base_id = market.get("baseId")
+        quote_id = market.get("quoteId")
+        symbol = market.get("symbol")
+        if not all(
+            isinstance(value, str) and value
+            for value in (base_id, quote_id, symbol)
+        ):
+            continue
+
+        ticker = f"{base_id.upper()}{quote_id.upper()}"
+        mexc_symbols_by_ticker.setdefault(ticker, []).append(symbol)
+
+    return {
+        ticker: mexc_symbols_by_ticker[ticker][0]
+        for ticker in sorted(set(binance_symbols))
+        if len(mexc_symbols_by_ticker.get(ticker, [])) == 1
+    }
+
+
+def mexc_symbol_map(
+    binance_symbols: list[str], pacer: RequestPacer
+) -> dict[str, str]:
+    exchange = ccxt.mexc({"enableRateLimit": True, "timeout": 20000})
+    pacer.wait()
+    mexc_markets = exchange.load_markets()
+    return match_mexc_symbols(binance_symbols, mexc_markets)
+
+
+def available_symbols(
+    pacer: RequestPacer,
+) -> tuple[list[str], dict[str, str]]:
+    binance_symbols = binance_perpetual_symbols(pacer)
+    return binance_symbols, mexc_symbol_map(binance_symbols, pacer)
+
+
+def closed_candles_from_rows(rows: list[list[Any]], timeframe: str) -> list[Candle]:
     if len(rows) < 3:
         raise RuntimeError(f"Not enough {timeframe} candles returned")
     rows.sort(key=lambda row: int(row[0]))
-    if len(rows) < 3:
-        raise RuntimeError(f"Not enough {timeframe} candles returned")
     return [
         Candle(
             open_time=int(row[0]),
@@ -166,6 +208,46 @@ def get_closed_candles(
         )
         for row in rows[:-1]
     ]
+
+
+def get_closed_candles(
+    symbol: str,
+    timeframe: str,
+    pacer: RequestPacer,
+    mexc_symbol: str | None = None,
+) -> tuple[list[Candle], str]:
+    binance_errors: list[str] = []
+    for base_url in BINANCE_FUTURES_URLS:
+        try:
+            rows = http_json(
+                base_url,
+                "/fapi/v1/klines",
+                {"symbol": symbol, "interval": timeframe, "limit": KLINE_LIMIT},
+                pacer,
+            )
+            return closed_candles_from_rows(rows, timeframe), "Binance"
+        except Exception as error:
+            binance_errors.append(f"{base_url}: {error}")
+
+    binance_error = "; ".join(binance_errors)
+    if not mexc_symbol:
+        raise RuntimeError(
+            f"Binance candles unavailable for {symbol}: {binance_error}; "
+            "no matching MEXC USDT perpetual market is available as fallback"
+        )
+
+    try:
+        exchange = mexc_exchange(pacer)
+        pacer.wait()
+        mexc_rows = exchange.fetch_ohlcv(
+            mexc_symbol, timeframe, limit=KLINE_LIMIT
+        )
+        return closed_candles_from_rows(mexc_rows, timeframe), "MEXC yedek"
+    except Exception as error:
+        raise RuntimeError(
+            f"Binance candles unavailable for {symbol}: {binance_error}; "
+            f"MEXC fallback failed for {mexc_symbol}: {error}"
+        ) from error
 
 
 def calculate_atr(candles: list[Candle], period: int) -> list[float | None]:
@@ -452,10 +534,15 @@ def scan_indicator_zones(candles: list[Candle]) -> dict[str, bool]:
 
 
 def scan_pair(
-    symbol: str, timeframe: str, pacer: RequestPacer
+    symbol: str,
+    timeframe: str,
+    pacer: RequestPacer,
+    mexc_symbol: str | None = None,
 ) -> dict[str, Any]:
     try:
-        candles = get_closed_candles(symbol, timeframe, pacer)
+        candles, data_source = get_closed_candles(
+            symbol, timeframe, pacer, mexc_symbol
+        )
         structure = scan_structure(candles)["event"]
         zones = scan_indicator_zones(candles)
         current_event = structure if structure and structure["bars_ago"] == 0 else None
@@ -484,6 +571,7 @@ def scan_pair(
             "price": candles[-1].close,
             "conditions": conditions,
             "matches": matches,
+            "data_source": data_source,
             "error": "",
         }
     except Exception as error:
@@ -494,6 +582,7 @@ def scan_pair(
             "price": None,
             "conditions": {},
             "matches": [],
+            "data_source": "",
             "error": str(error),
         }
 
@@ -580,6 +669,7 @@ def notify_hourly_summary(
 
     lines = [
         "🔥 <b>4 SAATLİK BINANCE FUTURES TARAMA</b>",
+        "📡 Veri: Binance öncelikli · MEXC yedek",
         f"⏰ Saatlik toplam · {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:52')} UTC",
         f"📊 <b>{len(ranked)} parite / {len(CONDITIONS)} koşul</b>",
         "━━━━━━━━━━━━━━━━",
@@ -613,15 +703,24 @@ def run() -> int:
     pacer = RequestPacer(REQUEST_INTERVAL)
     symbols = binance_perpetual_symbols(pacer)
     print(f"Binance USD-M: {len(symbols)} aktif USDT-M perpetual parite.")
+    try:
+        mexc_symbols = mexc_symbol_map(symbols, pacer)
+        print(f"MEXC yedek eşleşmesi: {len(mexc_symbols)} parite.")
+    except Exception as error:
+        mexc_symbols = {}
+        print(f"MEXC yedeği kullanılamıyor; Binance taraması sürecek: {error}")
 
     results_by_timeframe: dict[str, dict[str, dict[str, Any]]] = {}
     errors = 0
+    data_source_counts = {"Binance": 0, "MEXC yedek": 0}
     for timeframe in TIMEFRAMES:
         print(f"{timeframe} taraması başlıyor...")
         results: dict[str, dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=WORKERS) as executor:
             futures = {
-                executor.submit(scan_pair, symbol, timeframe, pacer): symbol
+                executor.submit(
+                    scan_pair, symbol, timeframe, pacer, mexc_symbols.get(symbol)
+                ): symbol
                 for symbol in symbols
             }
             for completed, future in enumerate(as_completed(futures), start=1):
@@ -631,6 +730,7 @@ def run() -> int:
                     print(f"  Hata {result['symbol']} {timeframe}: {result['error']}")
                 else:
                     results[result["symbol"]] = result
+                    data_source_counts[result["data_source"]] += 1
                 if completed % 100 == 0 or completed == len(symbols):
                     print(f"  {timeframe}: {completed}/{len(symbols)} tamamlandı")
         results_by_timeframe[timeframe] = results
@@ -694,6 +794,11 @@ def run() -> int:
         )
 
     print(f"Yeni koşul eşleşmesi: {len(newly_matched)}")
+    print(
+        "Veri kaynağı kullanımı: "
+        f"Binance {data_source_counts['Binance']}, "
+        f"MEXC yedek {data_source_counts['MEXC yedek']}."
+    )
     if datetime.now(timezone.utc).minute >= 52 and hourly_sent_bucket != current_hour:
         notify_hourly_summary(hourly_seen, results_by_timeframe)
         hourly_sent_bucket = current_hour
