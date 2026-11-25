@@ -681,6 +681,7 @@ def send_telegram(message: str) -> None:
         raise RuntimeError(f"Telegram connection failed: {reason}") from None
     if not result.get("ok"):
         raise RuntimeError(f"Telegram rejected message: {result}")
+    print("Telegram: saatlik özet başarıyla gönderildi.")
 
 
 def notify_hourly_summary(
@@ -697,11 +698,8 @@ def notify_hourly_summary(
         if total:
             ranked.append((total, symbol, per_timeframe))
     ranked.sort(key=lambda item: (-item[0], item[1]))
-    if not ranked:
-        return
-
     lines = [
-        "🔥 <b>4 SAATLİK BINANCE FUTURES TARAMA</b>",
+        "🔥 <b>4 SAATLİK FUTURES TARAMA</b>",
         "📡 Veri: Binance öncelikli · MEXC yedek",
         f"⏰ Saatlik toplam · {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:52')} UTC",
         f"📊 <b>{len(ranked)} parite / {len(CONDITIONS)} koşul</b>",
@@ -903,8 +901,8 @@ def run() -> int:
                 else:
                     results[result["symbol"]] = result
                     data_source_counts[result["data_source"]] += 1
-                if completed % 100 == 0 or completed == len(symbols):
-                    print(f"  {timeframe}: {completed}/{len(symbols)} tamamlandı")
+                if completed % 100 == 0 or completed == len(scan_symbols):
+                    print(f"  {timeframe}: {completed}/{len(scan_symbols)} tamamlandı")
         results_by_timeframe[timeframe] = results
 
     write_html_report(symbols, results_by_timeframe, scan_errors)
@@ -975,6 +973,7 @@ def run() -> int:
         f"MEXC yedek {data_source_counts['MEXC yedek']}."
     )
     if datetime.now(timezone.utc).minute >= 52 and hourly_sent_bucket != current_hour:
+        print("Saatlik özet gönderiliyor...")
         notify_hourly_summary(hourly_seen, results_by_timeframe)
         hourly_sent_bucket = current_hour
     else:

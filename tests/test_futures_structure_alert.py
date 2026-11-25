@@ -144,6 +144,50 @@ class HtmlReportTests(unittest.TestCase):
         self.assertIn("MEXC yedek", report)
 
 
+class TelegramSummaryTests(unittest.TestCase):
+    @patch.object(scanner, "send_telegram")
+    def test_sends_hourly_summary_even_when_no_symbol_matches(
+        self, send_telegram
+    ) -> None:
+        scanner.notify_hourly_summary(set(), {})
+
+        send_telegram.assert_called_once()
+        message = send_telegram.call_args.args[0]
+        self.assertIn("4 SAATLİK FUTURES TARAMA", message)
+        self.assertIn("0 parite / 7 koşul", message)
+
+    @patch.object(scanner, "send_telegram")
+    def test_sends_ranked_hourly_summary_for_signal_match(
+        self, send_telegram
+    ) -> None:
+        symbol = "BTCUSDT"
+        conditions = {
+            "bu_ob_inside": False,
+            "bu_ob_confirm": False,
+            "be_ob_inside": False,
+            "choch": False,
+            "bos": True,
+            "ftr": False,
+            "reversal": False,
+        }
+        results = {
+            "4h": {
+                symbol: {
+                    "matches": ["BOS"],
+                    "conditions": conditions,
+                }
+            }
+        }
+
+        scanner.notify_hourly_summary(
+            {f"{symbol}|4h|bos"}, results
+        )
+
+        send_telegram.assert_called_once()
+        self.assertIn("BTCUSDT", send_telegram.call_args.args[0])
+        self.assertIn("1/7", send_telegram.call_args.args[0])
+
+
 class MexcFallbackMarketTests(unittest.TestCase):
     def test_only_maps_active_mexc_perpetuals_in_binance_universe(self) -> None:
         markets = {
