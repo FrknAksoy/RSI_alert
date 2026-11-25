@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Scan closed MEXC USDT perpetual candles and send structure matches to Telegram."""
+"""Scan closed Binance USD-M perpetual candles and send structure matches to Telegram."""
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import sys
@@ -19,7 +20,12 @@ from pathlib import Path
 from typing import Any
 
 
-EXCHANGE_NAME = "mexc"
+BINANCE_FUTURES_URLS = (
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+)
 TELEGRAM_URL = "https://api.telegram.org"
 TIMEFRAMES = ("4h",)
 KLINE_LIMIT = 1000
@@ -33,6 +39,7 @@ MAX_ACTIVE_LIQUIDITY = 30
 WORKERS = 8
 REQUEST_INTERVAL = 0.15
 STATE_FILE = Path(__file__).with_name("futures_state.json")
+HTML_REPORT_FILE = Path(__file__).with_name("futures_report.html")
 CONDITIONS = (
     ("bu_ob_inside", "BU-OB İÇİNDE"),
     ("bu_ob_confirm", "BU-OB TEYİT"),
@@ -42,6 +49,7 @@ CONDITIONS = (
     ("ftr", "FTR BÖLGESİ"),
     ("reversal", "REVERSAL BÖLGESİ"),
 )
+_MEXC_THREAD_LOCAL = threading.local()
 
 
 @dataclass(frozen=True)
@@ -105,37 +113,93 @@ def http_json(
     raise RuntimeError(f"Request failed: {path}")
 
 
-def available_symbols(pacer: RequestPacer) -> list[str]:
-    exchange = getattr(ccxt, EXCHANGE_NAME)({"enableRateLimit": True, "timeout": 20000})
-    markets = exchange.load_markets()
-    symbols = sorted(
-        market["symbol"]
-        for market in markets.values()
-        if market.get("contract")
-        and market.get("linear")
-        and market.get("quote") == "USDT"
-    )
+def binance_perpetual_symbols(pacer: RequestPacer) -> list[str]:
+    exchange_info = None
+    last_error = ""
+    for base_url in BINANCE_FUTURES_URLS:
+        try:
+            exchange_info = http_json(base_url, "/fapi/v1/exchangeInfo", {}, pacer)
+            break
+        except Exception as error:
+            last_error = str(error)
+    if exchange_info is None:
+        raise RuntimeError(f"Binance Futures API unavailable: {last_error}")
+
+    symbols = {
+        item["symbol"]
+        for item in exchange_info.get("symbols", [])
+        if item.get("status") == "TRADING"
+        and item.get("quoteAsset", item.get("quoteCoin")) == "USDT"
+        and item.get("contractType") in ("PERPETUAL", "TRADIFI_PERPETUAL")
+    }
     if not symbols:
-        raise RuntimeError("MEXC returned no active USDT-M perpetual contracts")
-    return symbols
+        raise RuntimeError("Binance returned no active USDT-M perpetual contracts")
+    return sorted(symbols)
 
 
-def get_closed_candles(
-    symbol: str, timeframe: str, pacer: RequestPacer
-) -> list[Candle]:
-    exchange = getattr(ccxt, EXCHANGE_NAME)({"enableRateLimit": True, "timeout": 20000})
-    exchange_rows = exchange.fetch_ohlcv(symbol, "4h", limit=KLINE_LIMIT)
-    if len(exchange_rows) < 3:
-        raise RuntimeError(f"Not enough {timeframe} candles returned")
-    rows = [
-        [
-            row[0], row[1], row[2], row[3], row[4],
-        ]
-        for row in exchange_rows
-    ]
-    rows.sort(key=lambda row: int(row[0]))
+def mexc_exchange(pacer: RequestPacer) -> Any:
+    exchange = getattr(_MEXC_THREAD_LOCAL, "exchange", None)
+    if exchange is None:
+        exchange = ccxt.mexc({"enableRateLimit": True, "timeout": 20000})
+        pacer.wait()
+        exchange.load_markets()
+        _MEXC_THREAD_LOCAL.exchange = exchange
+    return exchange
+
+
+def match_mexc_symbols(
+    binance_symbols: list[str], markets: dict[str, dict[str, Any]]
+) -> dict[str, str]:
+    mexc_symbols_by_ticker: dict[str, list[str]] = {}
+    for market in markets.values():
+        if not (
+            market.get("active") is True
+            and market.get("contract") is True
+            and market.get("swap") is True
+            and market.get("linear") is True
+            and market.get("quote") == "USDT"
+        ):
+            continue
+
+        base_id = market.get("baseId")
+        quote_id = market.get("quoteId")
+        symbol = market.get("symbol")
+        if not all(
+            isinstance(value, str) and value
+            for value in (base_id, quote_id, symbol)
+        ):
+            continue
+
+        ticker = f"{base_id.upper()}{quote_id.upper()}"
+        mexc_symbols_by_ticker.setdefault(ticker, []).append(symbol)
+
+    return {
+        ticker: mexc_symbols_by_ticker[ticker][0]
+        for ticker in sorted(set(binance_symbols))
+        if len(mexc_symbols_by_ticker.get(ticker, [])) == 1
+    }
+
+
+def mexc_symbol_map(
+    binance_symbols: list[str], pacer: RequestPacer
+) -> dict[str, str]:
+    exchange = ccxt.mexc({"enableRateLimit": True, "timeout": 20000})
+    pacer.wait()
+    mexc_markets = exchange.load_markets()
+    return match_mexc_symbols(binance_symbols, mexc_markets)
+
+
+def available_symbols(
+    pacer: RequestPacer,
+) -> tuple[list[str], dict[str, str]]:
+    binance_symbols = binance_perpetual_symbols(pacer)
+    return binance_symbols, mexc_symbol_map(binance_symbols, pacer)
+
+
+def closed_candles_from_rows(rows: list[list[Any]], timeframe: str) -> list[Candle]:
     if len(rows) < 3:
         raise RuntimeError(f"Not enough {timeframe} candles returned")
+    rows.sort(key=lambda row: int(row[0]))
     return [
         Candle(
             open_time=int(row[0]),
@@ -146,6 +210,46 @@ def get_closed_candles(
         )
         for row in rows[:-1]
     ]
+
+
+def get_closed_candles(
+    symbol: str,
+    timeframe: str,
+    pacer: RequestPacer,
+    mexc_symbol: str | None = None,
+) -> tuple[list[Candle], str]:
+    binance_errors: list[str] = []
+    for base_url in BINANCE_FUTURES_URLS:
+        try:
+            rows = http_json(
+                base_url,
+                "/fapi/v1/klines",
+                {"symbol": symbol, "interval": timeframe, "limit": KLINE_LIMIT},
+                pacer,
+            )
+            return closed_candles_from_rows(rows, timeframe), "Binance"
+        except Exception as error:
+            binance_errors.append(f"{base_url}: {error}")
+
+    binance_error = "; ".join(binance_errors)
+    if not mexc_symbol:
+        raise RuntimeError(
+            f"Binance candles unavailable for {symbol}: {binance_error}; "
+            "no matching MEXC USDT perpetual market is available as fallback"
+        )
+
+    try:
+        exchange = mexc_exchange(pacer)
+        pacer.wait()
+        mexc_rows = exchange.fetch_ohlcv(
+            mexc_symbol, timeframe, limit=KLINE_LIMIT
+        )
+        return closed_candles_from_rows(mexc_rows, timeframe), "MEXC yedek"
+    except Exception as error:
+        raise RuntimeError(
+            f"Binance candles unavailable for {symbol}: {binance_error}; "
+            f"MEXC fallback failed for {mexc_symbol}: {error}"
+        ) from error
 
 
 def calculate_atr(candles: list[Candle], period: int) -> list[float | None]:
@@ -432,10 +536,15 @@ def scan_indicator_zones(candles: list[Candle]) -> dict[str, bool]:
 
 
 def scan_pair(
-    symbol: str, timeframe: str, pacer: RequestPacer
+    symbol: str,
+    timeframe: str,
+    pacer: RequestPacer,
+    mexc_symbol: str | None = None,
 ) -> dict[str, Any]:
     try:
-        candles = get_closed_candles(symbol, timeframe, pacer)
+        candles, data_source = get_closed_candles(
+            symbol, timeframe, pacer, mexc_symbol
+        )
         structure = scan_structure(candles)["event"]
         zones = scan_indicator_zones(candles)
         current_event = structure if structure and structure["bars_ago"] == 0 else None
@@ -464,6 +573,7 @@ def scan_pair(
             "price": candles[-1].close,
             "conditions": conditions,
             "matches": matches,
+            "data_source": data_source,
             "error": "",
         }
     except Exception as error:
@@ -474,6 +584,7 @@ def scan_pair(
             "price": None,
             "conditions": {},
             "matches": [],
+            "data_source": "",
             "error": str(error),
         }
 
@@ -559,7 +670,8 @@ def notify_hourly_summary(
         return
 
     lines = [
-        "🔥 <b>4 SAATLİK MEXC FUTURES TARAMA</b>",
+        "🔥 <b>4 SAATLİK BINANCE FUTURES TARAMA</b>",
+        "📡 Veri: Binance öncelikli · MEXC yedek",
         f"⏰ Saatlik toplam · {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:52')} UTC",
         f"📊 <b>{len(ranked)} parite / {len(CONDITIONS)} koşul</b>",
         "━━━━━━━━━━━━━━━━",
@@ -580,10 +692,139 @@ def notify_hourly_summary(
     for line in lines:
         if len(message) + len(line) + 1 > 3800:
             send_telegram(message)
-            message = "MEXC Futures — devamı\n"
+            message = "Binance Futures — devamı\n"
         message += line + "\n"
     if message.strip():
         send_telegram(message)
+
+
+def write_html_report(
+    symbols: list[str],
+    results_by_timeframe: dict[str, dict[str, dict[str, Any]]],
+    scan_errors: dict[tuple[str, str], str],
+    generated_at: datetime | None = None,
+    output_path: Path = HTML_REPORT_FILE,
+) -> None:
+    generated_at = generated_at or datetime.now(timezone.utc)
+    rows: list[str] = []
+    successful_count = 0
+    signal_count = 0
+    fallback_count = 0
+    error_count = 0
+
+    for symbol in symbols:
+        for timeframe in TIMEFRAMES:
+            result = results_by_timeframe.get(timeframe, {}).get(symbol)
+            error = scan_errors.get((timeframe, symbol), "")
+            if result:
+                successful_count += 1
+                matches = result["matches"]
+                signal_count += bool(matches)
+                fallback_count += result["data_source"] == "MEXC yedek"
+                status = "Sinyal var" if matches else "Sinyal yok"
+                status_class = "signal" if matches else "clear"
+                source = result["data_source"]
+                price = f'{float(result["price"]):,.8g}'
+                conditions = result["conditions"]
+                candle_time = datetime.fromtimestamp(
+                    result["candle"] / 1000, tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M UTC")
+                match_labels = ", ".join(matches) if matches else "—"
+            else:
+                error_count += 1
+                status = "Veri alınamadı"
+                status_class = "error"
+                source = "—"
+                price = "—"
+                conditions = {}
+                candle_time = "—"
+                match_labels = error or "Tarama sonucu yok"
+
+            condition_cells = "".join(
+                '<td class="condition '
+                + ("active" if conditions.get(key) else "")
+                + '">'
+                + ("✓" if conditions.get(key) else "—")
+                + "</td>"
+                for key, _ in CONDITIONS
+            )
+            rows.append(
+                f'<tr data-status="{status_class}">'
+                f"<td><strong>{html.escape(symbol)}</strong></td>"
+                f"<td>{html.escape(timeframe)}</td>"
+                f'<td><span class="badge {status_class}">{html.escape(status)}</span></td>'
+                f"<td>{html.escape(source)}</td>"
+                f"<td>{html.escape(price)}</td>"
+                f"<td>{html.escape(candle_time)}</td>"
+                f"<td>{html.escape(match_labels)}</td>"
+                f"{condition_cells}</tr>"
+            )
+
+    template = """<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Binance Futures Tarama Raporu</title>
+<style>
+:root{color-scheme:light dark;font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+body{margin:0;background:#f6f8fa;color:#1f2328}
+main{max-width:1600px;margin:0 auto;padding:24px}
+h1{margin:0 0 6px;font-size:1.7rem}.muted{color:#656d76}
+.summary{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0}
+.card{background:white;border:1px solid #d1d9e0;border-radius:8px;padding:12px 16px;min-width:125px}
+.card strong{display:block;font-size:1.35rem}
+.controls{display:flex;gap:10px;margin:16px 0}
+input,select{padding:9px 11px;border:1px solid #d1d9e0;border-radius:6px;background:white;color:inherit}
+input{min-width:240px;flex:1}
+.table-wrap{overflow:auto;background:white;border:1px solid #d1d9e0;border-radius:8px}
+table{border-collapse:collapse;width:100%;min-width:1250px}
+th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #d8dee4;white-space:nowrap}
+th{position:sticky;top:0;background:#f6f8fa;z-index:1}
+tbody tr:hover{background:#f6f8fa}.badge{padding:3px 8px;border-radius:12px;font-size:.85rem}
+.badge.signal{background:#dafbe1;color:#116329}.badge.clear{background:#ddf4ff;color:#0550ae}
+.badge.error{background:#ffebe9;color:#cf222e}.condition{text-align:center;color:#8c959f}
+.condition.active{background:#dafbe1;color:#116329;font-weight:bold}
+@media(prefers-color-scheme:dark){body{background:#0d1117;color:#e6edf3}.card,.table-wrap{background:#161b22;border-color:#30363d}th,input,select{background:#161b22;border-color:#30363d;color:#e6edf3}th{background:#21262d}th,td{border-color:#30363d}tbody tr:hover{background:#21262d}.muted{color:#8b949e}}
+</style>
+</head>
+<body><main>
+<h1>Binance Futures tarama raporu</h1>
+<div class="muted">Oluşturulma: __GENERATED_AT__ · Kaynak evren: aktif Binance USDⓈ-M USDT perpetual pariteleri · MEXC yalnızca Binance verisi alınamadığında yedektir.</div>
+<section class="summary">
+<div class="card"><strong>__SYMBOL_COUNT__</strong>Binance paritesi</div>
+<div class="card"><strong>__SUCCESS_COUNT__</strong>Başarılı tarama</div>
+<div class="card"><strong>__SIGNAL_COUNT__</strong>Sinyalli parite</div>
+<div class="card"><strong>__FALLBACK_COUNT__</strong>MEXC yedek</div>
+<div class="card"><strong>__ERROR_COUNT__</strong>Veri alınamayan</div>
+</section>
+<div class="controls">
+<input id="search" type="search" placeholder="Sembol veya sinyal ara">
+<select id="status"><option value="">Tüm durumlar</option><option value="signal">Sinyal var</option><option value="clear">Sinyal yok</option><option value="error">Veri alınamadı</option></select>
+</div>
+<div class="table-wrap"><table>
+<thead><tr><th>Parite</th><th>Zaman</th><th>Durum</th><th>Veri kaynağı</th><th>Son fiyat</th><th>Son kapanış</th><th>Sinyaller</th>__CONDITION_HEADERS__</tr></thead>
+<tbody id="results">__ROWS__</tbody>
+</table></div>
+</main>
+<script>
+const search=document.getElementById("search"),status=document.getElementById("status");
+function filterRows(){const q=search.value.toLocaleLowerCase("tr"),s=status.value;for(const row of document.querySelectorAll("#results tr")){row.hidden=(s&&row.dataset.status!==s)||!row.textContent.toLocaleLowerCase("tr").includes(q)}}
+search.addEventListener("input",filterRows);status.addEventListener("change",filterRows);
+</script>
+</body></html>"""
+    headers = "".join(f"<th>{html.escape(label)}</th>" for _, label in CONDITIONS)
+    report = (
+        template.replace("__GENERATED_AT__", html.escape(generated_at.strftime("%Y-%m-%d %H:%M UTC")))
+        .replace("__SYMBOL_COUNT__", str(len(symbols)))
+        .replace("__SUCCESS_COUNT__", str(successful_count))
+        .replace("__SIGNAL_COUNT__", str(signal_count))
+        .replace("__FALLBACK_COUNT__", str(fallback_count))
+        .replace("__ERROR_COUNT__", str(error_count))
+        .replace("__CONDITION_HEADERS__", headers)
+        .replace("__ROWS__", "".join(rows))
+    )
+    output_path.write_text(report, encoding="utf-8")
 
 
 def run() -> int:
@@ -591,29 +832,44 @@ def run() -> int:
         raise RuntimeError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID GitHub secrets are required")
 
     pacer = RequestPacer(REQUEST_INTERVAL)
-    symbols = available_symbols(pacer)
-    print(f"MEXC: {len(symbols)} aktif USDT-M perpetual parite.")
+    symbols = binance_perpetual_symbols(pacer)
+    print(f"Binance USD-M: {len(symbols)} aktif USDT-M perpetual parite.")
+    try:
+        mexc_symbols = mexc_symbol_map(symbols, pacer)
+        print(f"MEXC yedek eşleşmesi: {len(mexc_symbols)} parite.")
+    except Exception as error:
+        mexc_symbols = {}
+        print(f"MEXC yedeği kullanılamıyor; Binance taraması sürecek: {error}")
 
     results_by_timeframe: dict[str, dict[str, dict[str, Any]]] = {}
+    scan_errors: dict[tuple[str, str], str] = {}
     errors = 0
+    data_source_counts = {"Binance": 0, "MEXC yedek": 0}
     for timeframe in TIMEFRAMES:
         print(f"{timeframe} taraması başlıyor...")
         results: dict[str, dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=WORKERS) as executor:
             futures = {
-                executor.submit(scan_pair, symbol, timeframe, pacer): symbol
+                executor.submit(
+                    scan_pair, symbol, timeframe, pacer, mexc_symbols.get(symbol)
+                ): symbol
                 for symbol in symbols
             }
             for completed, future in enumerate(as_completed(futures), start=1):
                 result = future.result()
                 if result["error"]:
                     errors += 1
+                    scan_errors[(timeframe, result["symbol"])] = result["error"]
                     print(f"  Hata {result['symbol']} {timeframe}: {result['error']}")
                 else:
                     results[result["symbol"]] = result
+                    data_source_counts[result["data_source"]] += 1
                 if completed % 100 == 0 or completed == len(symbols):
                     print(f"  {timeframe}: {completed}/{len(symbols)} tamamlandı")
         results_by_timeframe[timeframe] = results
+
+    write_html_report(symbols, results_by_timeframe, scan_errors)
+    print(f"HTML tarama raporu yazıldı: {HTML_REPORT_FILE}")
 
     state = load_state()
     previous = set(state["active_conditions"])
@@ -674,6 +930,11 @@ def run() -> int:
         )
 
     print(f"Yeni koşul eşleşmesi: {len(newly_matched)}")
+    print(
+        "Veri kaynağı kullanımı: "
+        f"Binance {data_source_counts['Binance']}, "
+        f"MEXC yedek {data_source_counts['MEXC yedek']}."
+    )
     if datetime.now(timezone.utc).minute >= 52 and hourly_sent_bucket != current_hour:
         notify_hourly_summary(hourly_seen, results_by_timeframe)
         hourly_sent_bucket = current_hour
