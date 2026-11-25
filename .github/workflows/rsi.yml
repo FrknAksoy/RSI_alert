@@ -30,6 +30,19 @@ jobs:
           key: futures-state-${{ github.run_id }}
           restore-keys: futures-state-
 
+      - name: Saatlik HTML rapor zamanını belirle
+        id: report_cadence
+        shell: bash
+        env:
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          minute="$(date -u -d "$RUN_STARTED_AT" +%M)"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" || "$minute" -ge 52 ]]; then
+            echo "upload=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "upload=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Kapalı 4s mumlarını tara ve saatlik Telegram özeti gönder
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -44,7 +57,7 @@ jobs:
           key: futures-state-${{ github.run_id }}
 
       - name: HTML tarama raporunu sakla
-        if: always()
+        if: always() && steps.report_cadence.outputs.upload == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: futures-scan-report-${{ github.run_id }}
