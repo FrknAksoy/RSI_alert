@@ -40,6 +40,9 @@ WORKERS = 8
 REQUEST_INTERVAL = 0.15
 STATE_FILE = Path(__file__).with_name("futures_state.json")
 HTML_REPORT_FILE = Path(__file__).with_name("futures_report.html")
+BINANCE_SYMBOL_SNAPSHOT_FILE = Path(__file__).with_name(
+    "binance_usdt_perpetuals.txt"
+)
 CONDITIONS = (
     ("bu_ob_inside", "BU-OB İÇİNDE"),
     ("bu_ob_confirm", "BU-OB TEYİT"),
@@ -122,16 +125,37 @@ def binance_perpetual_symbols(pacer: RequestPacer) -> list[str]:
             break
         except Exception as error:
             last_error = str(error)
-    if exchange_info is None:
-        raise RuntimeError(f"Binance Futures API unavailable: {last_error}")
+    if exchange_info is not None:
+        symbols = {
+            item["symbol"]
+            for item in exchange_info.get("symbols", [])
+            if item.get("status") == "TRADING"
+            and item.get("quoteAsset", item.get("quoteCoin")) == "USDT"
+            and item.get("contractType") in ("PERPETUAL", "TRADIFI_PERPETUAL")
+        }
+    else:
+        symbols = set()
 
-    symbols = {
-        item["symbol"]
-        for item in exchange_info.get("symbols", [])
-        if item.get("status") == "TRADING"
-        and item.get("quoteAsset", item.get("quoteCoin")) == "USDT"
-        and item.get("contractType") in ("PERPETUAL", "TRADIFI_PERPETUAL")
-    }
+    if not symbols:
+        try:
+            snapshot_symbols = {
+                line.strip()
+                for line in BINANCE_SYMBOL_SNAPSHOT_FILE.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip().endswith("USDT")
+            }
+        except OSError as error:
+            raise RuntimeError(
+                f"Binance Futures API unavailable: {last_error}; "
+                f"and snapshot unavailable: {error}"
+            ) from error
+        if snapshot_symbols:
+            return sorted(snapshot_symbols)
+        raise RuntimeError(
+            f"Binance Futures API unavailable: {last_error}; "
+            "and snapshot contains no symbols"
+        )
     if not symbols:
         raise RuntimeError("Binance returned no active USDT-M perpetual contracts")
     return sorted(symbols)
